@@ -18,15 +18,14 @@ Since 2026-09 this design is also **code**, once:
 crate all three programs depend on by git tag. It carries `RelayConfig` and the
 per-relay startup probe, the common endpoint builder with the
 creation-vs-rebuild policy (and relay-only mode), a rebuildable endpoint
-handle, the server-side home-relay watchdog, and the endpoint-bound public-key
+handle, and the endpoint-bound public-key
 auth transcript over [`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys). A fix to any of that lands in the
 crate and reaches every program on its next tag bump, instead of being ported
 by hand three times.
 
 What stays in each program is what makes it that program: ALPNs, handshake
 formats, QUIC transport tuning, identity and key *files* (the crate takes
-values, never paths), connection-path status UIs, and the serve loops that
-drive the watchdog. ezvpn, which builds on a fork of iroh, redirects the
+values, never paths), connection-path status UIs, and server lifecycle handling. ezvpn, which builds on a fork of iroh, redirects the
 crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
 `iroh`.
 
@@ -36,11 +35,9 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
   shared design. Default vs custom relays, how that single choice also decides
   whether n0 internet discovery is on, relay hints, the shared relay auth token,
   the strict per-relay startup probe, and relay-only mode. **Start here.**
-- **[home-relay-watchdog.md](home-relay-watchdog.md)** — the server-side
-  watchdog for a custom-relay server that silently loses its home relay: the
-  nudge-then-rebuild escalation, the creation-vs-rebuild policy behind it, the
-  back-off for a relay that is really down, and how each program's serve loop
-  drives it.
+- **[home-relay-watchdog.md](home-relay-watchdog.md)** — native relay recovery, the historical
+  permanent-registration-loss incident, and how to restore the removed server
+  watchdog if that failure recurs.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
   three programs get from `iroh::Endpoint` and never implement themselves:
   connection establishment, hole punching and relay fallback, NAT traversal by

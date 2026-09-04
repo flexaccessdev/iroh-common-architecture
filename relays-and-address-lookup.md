@@ -129,10 +129,11 @@ The strictness is deliberate. A configured backup relay that is silently dead is
 worse than a startup failure: it gives false confidence in a failover path that
 does not exist. **Startup is strict; runtime is not** — once a process is
 running, losing a relay is survivable and the endpoint re-homes onto a surviving
-one. For the same reason a mid-run **rebuild** of an endpoint (see
-[home-relay-watchdog.md](home-relay-watchdog.md)) skips the probe: during an
-outage that strictness would block recovery through the one relay that still
-answers.
+one. Servers keep their endpoint alive and rely on iroh's native relay
+reconnects; there is no application watchdog or timed server rebuild. See
+[relay recovery and the historical workaround](home-relay-watchdog.md).
+Client reconnect escalation may still rebuild an endpoint, skipping the
+startup probe so one unavailable relay does not block recovery through another.
 
 `clear_ip_transports()` on the probe endpoint is what makes `online()` a *pure
 relay* reachability signal: a holepunched direct path can never mask a dead or

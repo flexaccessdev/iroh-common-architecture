@@ -1,88 +1,89 @@
-# The Home-Relay Watchdog
+# Relay recovery and the historical server watchdog
 
-A server configured with custom relays is reachable to off-LAN clients *only*
-through its home relay: with n0 discovery off, clients dial with relay hints,
-and a relay forwards QUIC Initials only to endpoints currently registered on
-it. iroh keeps that registration alive on its own, but it has been observed
-(v1.0.3, relays behind Cloudflare Tunnels that reset idle WebSockets roughly
-hourly) to silently lose its home relay for good after one such reset: no dial
-retries, no warnings, no registration on any relay. The server just stops being
-dialable until the process restarts, while LAN clients that find it over mDNS
-keep working and mask the outage. Relay-only clients see connect timeouts.
+## Current behavior
 
-The watchdog is `flexaccess_iroh::relay_watchdog::watch_home_relay`; each
-program's server serve loop drives it. It is armed for **custom relays only**:
-with the default relays reachability rests on n0 publishing and resolution,
-not on one relay registration.
+Starting with `flexaccess-iroh` v0.0.4, servers use iroh 1.1.x's native relay
+WebSocket liveness detection and reconnect behavior. There is no server
+watchdog, delayed `network_change()` nudge, or timed endpoint rebuild in
+flexaccess-iroh, flextunnel, ezvpn, or tunnel-rs. A relay outage leaves the
+server endpoint and its healthy direct connections alive. Initial custom-relay
+validation remains strict.
 
-## Escalation
+This removal is a deliberate return to native recovery, **not confirmation
+that iroh 1.1.0 fixes the historical permanent stall**. The original incident
+has not yet been reproduced and cleared on 1.1.0 without the workaround.
+Iroh 1.1.0 includes [#4444](https://github.com/n0-computer/iroh/pull/4444), which
+keeps priority messages responsive during relay reconnect backoff; that is a
+related fix, not proof that this incident is resolved. ezvpn retains its
+existing iroh 1.1.x fork through its workspace patch.
 
-The watchdog observes `Endpoint::home_relay_status()` and escalates like a
-client's reconnect loop:
+## Original flextunnel incident
 
-1. **Nudge** — after `RELAY_OUTAGE_NUDGE` (60 s) without a connected home
-   relay it calls `Endpoint::network_change()`, which forces a fresh net
-   report and relay re-selection. Enough when only iroh's bookkeeping went
-   stale. The 60 s rides out a routine relay reconnect (iroh's own backoff
-   caps at 16 s) plus the ~25 s cadence of its periodic net report.
-2. **Rebuild** — at the caller's rebuild deadline (`RELAY_OUTAGE_REBUILD`,
-   180 s from the outage start, by default) it resolves with a `RelayOutage`,
-   telling the serve loop to replace the endpoint: the in-process equivalent
-   of the restart known to fix it. The loop closes the wedged endpoint
-   (bounded wait, a slow close finishes in the background), binds a fresh one
-   with the **same identity** so the id clients dial never changes, and
-   accepts on it. Everything else the process holds — listeners, address
-   pools, client registries, status sockets — carries over; the old
-   endpoint's connections end with it and those clients reconnect on their
-   own. A failed rebuild is retried every 30 s.
+The server workaround originated in flextunnel on iroh 1.0.3. After a routine
+relay WebSocket reset in a Cloudflare Tunnel deployment (observed roughly
+hourly), the server permanently lost its home-relay registration: no further
+dial retries, no warnings, and no registration on either configured relay.
+Off-LAN clients, including the iOS app, timed out. A LAN Mac client could still
+connect through mDNS, masking the failure. Restarting the service restored
+relay access. The reset was the observed trigger; the underlying iroh defect
+was not established.
 
-A reconnect at any point resets the clock. Only the *home* relay matters:
-non-home relays are connected on demand and dropped after a minute idle, which
-is normal and never counts as an outage.
+History:
 
-## Creation is strict, rebuild is tolerant
+- [flextunnel 3a1d25d](https://github.com/flexaccessdev/flextunnel/commit/3a1d25d836f114c813f9ba8cdec0ec5845649be5): server watchdog and endpoint rebuild.
+- [flextunnel 4f398c7](https://github.com/flexaccessdev/flextunnel/commit/4f398c7803f1dd96e2394f43a539fd7dc0724f33): upgrade to 1.1.0, explicitly retaining the workaround because the release did not claim to fix the incident.
+- [flextunnel 3fc6169](https://github.com/flexaccessdev/flextunnel/commit/3fc6169e0248c00b53c1ada44c1950429b6d3275): backoff to avoid repeatedly dropping healthy LAN clients when the relay itself is unavailable.
+- [flexaccess-iroh v0.0.3](https://github.com/flexaccessdev/flexaccess-iroh/tree/v0.0.3): last shared release containing `src/relay_watchdog.rs` and its tests.
 
-The rebuild recipe (`flexaccess_iroh::endpoint::rebuild_endpoint`, wrapped by
-each program's `server_rebuild_factory`) deliberately differs from first
-creation (`create_endpoint`):
+## If the same failure returns
 
-- **No per-relay probe.** At creation the probe validates the configuration
-  and fails fast if *any* relay is down. Mid-outage that strictness would
-  block recovery through the one relay that still answers.
-- **The online wait may fail.** A fresh endpoint is no worse than the wedged
-  one it replaces — LAN peers can still find it over mDNS — and the watchdog
-  trips again if the relays stay unreachable.
+1. Capture the exact iroh version or fork revision and relay logs around the
+   reset, with `RUST_LOG=info,iroh=debug,iroh_relay=debug`. Record home-relay
+   status, whether reconnect attempts continue, whether the relays accept a
+   fresh endpoint, and whether LAN access still works. An unavailable relay or
+   rejected token alone is not the historical permanent stall.
+2. After capturing evidence, restart the affected server service to restore
+   access if a fresh endpoint can register. Existing sessions will disconnect.
+3. Reproduce with repeated WebSocket disconnects and idle periods, on one and
+   two custom relays. Test both relay-only access and healthy direct clients;
+   tunnel-rs is the relay-only reference. Verify registration and new inbound
+   dials recover after the relay becomes reachable, without replacing the
+   server endpoint.
+4. If the permanent stall is confirmed, restore the temporary workaround in
+   **flexaccess-iroh**, tag a new release, and update all consumer tags and
+   server integrations. Use the historical implementation as a reference;
+   do not keep disabled code or copy the watchdog into individual apps.
+   Investigate and report the underlying iroh failure with the reproduction.
 
-## Backing off when the relay itself is down
+### Workaround restoration requirements
 
-A rebuild only helps when iroh's bookkeeping went stale. When the relay is
-really unreachable the fresh endpoint never registers either, and rebuilding
-again every three minutes would keep dropping the LAN clients that still work.
-So the watchdog reports whether the endpoint held a home relay at *any* point
-of the watch (`RelayOutage::relay_seen`), and the serve loop doubles the
-rebuild deadline for each consecutive endpoint that never did: 180 s, 6 m,
-12 m, 24 m, then capped at 30 m. An endpoint that registers resets the
-escalation. The 60 s nudge is unaffected.
+The previous workaround observed `Endpoint::home_relay_status()` for custom
+relays only. It treated any connected home relay as healthy and reset its
+outage clock on recovery. Non-home relay idle disconnects were ignored.
 
-## Clients
+After 60 seconds without a connected home relay it called `network_change()`;
+after 180 seconds total it requested a server endpoint replacement. The caller
+closed the old endpoint and bound a new one with the same identity, ALPNs,
+allowlists, transport settings, and relay configuration. Rebuilds skipped the
+startup per-relay probe and tolerated the online wait failing; binding failures
+were retried every 30 seconds.
 
-A client has no home-relay registration to lose, but the same wedge (a relay
-link lost to a ping timeout that never re-establishes, stale cached paths,
-dead discovery state) can hit its endpoint. flextunnel's client reconnect loop
-escalates to `RebuildableEndpoint::rebuild` after repeated failures: a shared
-`Clone` handle whose concurrent rebuild calls coalesce, so two tasks noticing
-the same dead endpoint produce one replacement.
+The outage result recorded whether a home relay had ever connected. Consecutive
+endpoints that never registered extended the rebuild deadline to 6, 12, 24,
+then 30 minutes; successful registration reset that escalation. This matters:
+a genuinely unavailable relay cannot be repaired by rebuilding, and every
+rebuild terminates healthy direct sessions too.
 
-## Where this lives
+Preserve graceful endpoint close, shutdown signals, and quick-mode idle exits
+through any restored rebuild loop. Stop bridge tasks tied to the retired
+endpoint. In ezvpn, update the status endpoint and TUN self-encapsulation UDP
+port filter when the endpoint changes. Restore the outage timing tests and
+consumer backoff tests, then run clippy, unit tests, and relay recovery tests.
 
-| Repo | Watchdog + rebuild policy | Serve loop (closes, rebuilds, backs off) |
-|---|---|---|
-| [flexaccess-iroh] | `src/relay_watchdog.rs`, `src/endpoint.rs` | — |
-| [flextunnel] | crate | `crates/flextunnel-cli/src/main.rs`; clients use `RebuildableEndpoint` |
-| [ezvpn] | crate | `VpnServer::run` in `src/tunnel/server.rs` |
-| [tunnel-rs] | crate | `run_multi_source_server` in `src/iroh_mode/multi_source.rs` |
+## Separate client recovery
 
-[flexaccess-iroh]: https://github.com/flexaccessdev/flexaccess-iroh
-[tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
-[ezvpn]: https://github.com/flexaccessdev/ezvpn
-[flextunnel]: https://github.com/flexaccessdev/flextunnel
+Flextunnel's client `RebuildableEndpoint` escalation remains in use. It came
+from a separate WSL2 incident: a relay ping timeout followed by repeated
+30-second reconnect failures, immediately repaired by a client restart
+([a2f94c8](https://github.com/flexaccessdev/flextunnel/commit/a2f94c8ba82c3868cfb87d0fb829b72db6b5e0f0)). Removing the server watchdog does not
+remove the shared client rebuild API or its tests.
