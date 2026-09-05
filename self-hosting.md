@@ -1,13 +1,17 @@
 # Self-Hosting Iroh Infrastructure
 
-How to self-host iroh relay servers for fully independent operation. This
-applies to [tunnel-rs], [ezvpn], and [flextunnel] alike — they share the relay
-design described in
+How to self-host iroh relay servers and the address lookup service that goes
+with them, for fully independent operation. This applies to [tunnel-rs],
+[ezvpn], and [flextunnel] alike — they share the relay design described in
 [relays-and-address-lookup.md](relays-and-address-lookup.md).
 
-Configuring any custom relay disables internet discovery automatically, so a
-self-hosted relay is all the infrastructure you need: **no discovery service, no
-contact with public iroh infrastructure.**
+A custom-relay deployment contacts **no public iroh infrastructure**. It needs
+two things of yours: **at least two relays**, and **one address lookup service**
+(`iroh-dns-server`) that servers publish their current relay to and every
+endpoint resolves from. The lookup service is mandatory with custom relays;
+its outage is survivable (dials are carried by relay hints), so a single
+instance on its own hostname is the intended shape — see
+[relay-failover-findings.md](relay-failover-findings.md).
 
 > **Reference program: [tunnel-rs].** It is the only one of the three with a
 > first-class relay-only mode (`--relay-only`) and a fully offline two-relay e2e
@@ -155,6 +159,150 @@ cloudflared tunnel run --token <token>
 > job is a pure relay-only fallback this is fine; if you want to maximize direct
 > P2P success, use the TLS + QUIC production config above instead.
 
+## Address lookup service: iroh-dns-server behind Cloudflare Tunnel
+
+The lookup service is [`iroh-dns-server`](https://github.com/n0-computer/iroh/tree/main/iroh-dns-server),
+the same program n0 runs as `dns.iroh.link`, run once on its **own hostname**
+(not on a relay host — the relay ingress stays single-purpose) behind the same
+kind of Cloudflare Tunnel as the relays. Only its HTTP API is used: servers
+`PUT /pkarr/<id>` a signed record, everyone `GET /pkarr/<id>` it. Its DNS
+listener is unused and stays on localhost.
+
+`iroh-dns-server` has **no authentication**: anyone can publish under their own
+id and read any record. Access is gated by a **capability URL** instead — the
+secret is a path segment in front of the API, checked by a small proxy in front
+of the server. `cloudflared` cannot rewrite paths, so that proxy (Caddy below)
+also strips the secret before forwarding.
+
+```
+clients/servers ──https──▶ Cloudflare edge ──tunnel──▶ cloudflared ──▶ Caddy :8080 ──▶ iroh-dns-server :8053
+   /lks1-…/pkarr/<id>                                                  strips /lks1-…      /pkarr/<id>
+```
+
+**1. Run iroh-dns-server** (version matching the iroh the programs use):
+
+```bash
+cargo install iroh-dns-server --version 1.1.0
+iroh-dns-server --config dns.toml
+```
+
+`dns.toml` (verified against iroh-dns-server 1.1.0):
+
+```toml
+# Plain HTTP on localhost only; Cloudflare terminates TLS, Caddy fronts this.
+[http]
+port = 8053
+bind_addr = "127.0.0.1"
+# No [https] section: nothing here is exposed directly.
+
+# The DNS listener is mandatory in the config but unused by our programs
+# (they resolve over the HTTP API). Keep it off the tunnel.
+[dns]
+port = 5353
+bind_addr = "127.0.0.1"
+default_ttl = 30
+origins = ["lookup.example.com"]
+default_soa = "ns1.lookup.example.com hostmaster.lookup.example.com 0 10800 3600 604800 3600"
+
+# Every request arrives from Caddy on localhost, so a per-IP limit would put
+# all publishers in one bucket. The capability URL gates writes instead.
+pkarr_put_rate_limit = "disabled"
+
+# Never fall back to the public BitTorrent DHT for unknown ids.
+[mainline]
+enabled = false
+
+[metrics]
+disabled = true
+
+data_dir = "/var/lib/iroh-dns"
+```
+
+Records are republished by each server every 5 minutes with a 30 s TTL; the
+store keeps a record for 7 days without a republish, so a server that is down
+for a while still resolves to its last relay until it comes back.
+
+**2. Front it with Caddy**, which enforces and strips the secret:
+
+```
+# /etc/caddy/Caddyfile
+:8080 {
+	handle_path /lks1-REPLACE_WITH_YOUR_SECRET/* {
+		reverse_proxy 127.0.0.1:8053
+	}
+	respond 404
+}
+```
+
+`handle_path` strips the matched prefix, so `/lks1-…/pkarr/<id>` reaches the
+dns server as `/pkarr/<id>` and `/lks1-…/healthz` as `/healthz`; every other
+path is a 404.
+
+**3. Point cloudflared at Caddy** on a dedicated hostname:
+
+```yaml
+ingress:
+  - hostname: lookup.example.com
+    service: http://localhost:8080
+  - service: http_status:404
+```
+
+**4. Verify:**
+
+```bash
+# {"status":"ok","version":"1.1.0",...}
+curl -s https://lookup.example.com/lks1-…/healthz
+
+# 404 before the server has published, 200 once it has (body is the signed record)
+curl -s -o /dev/null -w '%{http_code}
+' https://lookup.example.com/lks1-…/pkarr/<server-endpoint-id>
+
+# 404: without the secret there is no service at all
+curl -s -o /dev/null -w '%{http_code}
+' https://lookup.example.com/pkarr/<server-endpoint-id>
+```
+
+### Generating the lookup secret
+
+The secret is a `lks1-`-prefixed z-base-32 token over 20 random bytes
+followed by their CRC-32, so every program can reject a mistyped or truncated
+secret at config load. z-base-32 is lowercase letters and digits only — the
+alphabet iroh already uses for the endpoint ids that share this URL — so the
+secret survives anything that lowercases a URL, which a mixed-case base64
+token would not. Generate it with the crate's generator —
+tunnel-rs exposes it as a subcommand:
+
+```bash
+tunnel-rs generate-lookup-secret
+# lks1-<39 z-base-32 characters>
+```
+
+Put the same value in the Caddyfile (step 2) and in `lookup_secret` on **every**
+server and client, alongside `lookup_url = "https://lookup.example.com"`. Treat
+it as a credential separate from the relay token: it appears in cloudflared,
+Caddy, and dns-server access logs, so rotate it by changing the Caddyfile and
+the configs, never by reusing the relay token.
+
+| Repo | Config keys | CLI | Env |
+|---|---|---|---|
+| [tunnel-rs] | `[iroh].lookup_url`, `[iroh].lookup_secret` | `--lookup-url`, `--lookup-secret` | `TUNNEL_RS_LOOKUP_URL`, `TUNNEL_RS_LOOKUP_SECRET` |
+| [ezvpn] | `[iroh].lookup_url`, `[iroh].lookup_secret` | — | — |
+| [flextunnel] | `lookup_url`, `lookup_secret` | `--lookup-url`, `--lookup-secret` | — |
+
+> **Status:** tunnel-rs is the first consumer; the ezvpn and flextunnel rows
+> are the planned shape and land when those programs bump to the crate tag
+> that carries the lookup.
+
+### When the lookup service is down
+
+Nothing stops. Dials are carried by the relay hints, `online()` waits for a
+relay and not for a publish, and a failed publish is retried with a growing
+delay until the service is back. What is lost is only the propagation of a
+relay change while it is down. The one exception is deliberate: a **server
+refuses to start** if its initial publish fails, because a server that starts
+unpublished would be found only through hints. Fix the lookup service, then
+start the server.
+
 ## Relay access token
 
 For a publicly reachable relay, require a shared bearer token so only your
@@ -259,22 +407,25 @@ nothing more.
 
 ## Using your infrastructure
 
-Point both sides at the relay. Exact flags differ per program; the shape is the
-same:
+Point both sides at the relays **and** the lookup service. Exact flags differ
+per program; the shape is the same:
 
 ```bash
 # tunnel-rs
-tunnel-rs server --relay-url https://relay.example.com \
+tunnel-rs server --relay-url https://relay-a.example.com --relay-url https://relay-b.example.com \
+  --lookup-url https://lookup.example.com --lookup-secret lks1-… \
   --secret-file ./server.key --allowed-tcp 127.0.0.0/8 \
   --authorized-keys-file ./authorized_keys
 
-tunnel-rs client --relay-url https://relay.example.com \
+tunnel-rs client --relay-url https://relay-a.example.com --relay-url https://relay-b.example.com \
+  --lookup-url https://lookup.example.com --lookup-secret lks1-… \
   --server-node-id <ID> --source tcp://127.0.0.1:22 \
   --target 127.0.0.1:2222 --private-key-file ./client.key
 ```
 
-For ezvpn and flextunnel, set `relay_urls` (plus `relay_auth_token` if used) in
-the server and client config files. See each repo's own configuration docs.
+For ezvpn and flextunnel, set `relay_urls`, `lookup_url`, and `lookup_secret`
+(plus `relay_auth_token` if used) in the server and client config files. See
+each repo's own configuration docs.
 
 ## Relay behavior
 

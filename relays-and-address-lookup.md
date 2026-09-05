@@ -7,14 +7,22 @@ one implementation serves all three: the `relay` and `endpoint` modules of
 
 The default-vs-custom distinction is resolved **once**, at config time, into a
 `RelayConfig` enum — `Default` vs `Custom` — and it selects **both** which relay
-map iroh uses **and** whether iroh internet discovery (n0 pkarr publish + DNS
-lookup) is enabled. Discovery is *not* independently configurable; it strictly
-follows the relay mode: on for the default relays, off for custom relays.
+map iroh uses **and** which address lookup stack is installed. Lookup is *not*
+independently configurable; it strictly follows the relay mode: n0's public
+stack with the default relays, a **self-hosted, mandatory** lookup service with
+custom relays.
 
-| | Relay map | n0 pkarr publish | n0 DNS lookup | How the dialer finds the peer |
+| | Relay map | pkarr publish | Lookup | How the dialer finds the peer |
 |---|---|---|---|---|
-| **Default** | n0 public relays | with persistent identity only | yes | resolve the published record by endpoint ID |
-| **Custom** | configured relays | never | never | relay hints attached to the peer's `EndpointAddr` |
+| **Default** | n0 public relays | to n0, persistent identity only | n0 DNS | resolve the published record by endpoint ID |
+| **Custom** | configured relays | to the self-hosted service, persistent identity only | the self-hosted service, over HTTP | relay hints attached to the peer's `EndpointAddr`, **plus** the published record |
+
+> **Status (2026-09-04):** the custom-relay row is the design specified here
+> and being implemented in `flexaccess-iroh` (next tag after v0.0.3), with
+> [tunnel-rs] as the first consumer; [ezvpn] and [flextunnel] follow later.
+> A program still on v0.0.3 runs the previous design — custom relays with no
+> lookup at all — until it bumps the tag. The reasoning is in
+> [relay-failover-findings.md](relay-failover-findings.md).
 
 Whether an endpoint publishes at all is the program's call
 (`EndpointOptions::publish_address`): a server with a persistent identity does,
@@ -57,27 +65,61 @@ itself.
 
 ## Custom relays
 
-Internet discovery is **disabled** — nothing is published to or resolved from
-n0's `dns.iroh.link`. Instead the dialer attaches every configured relay URL to
-the peer's `EndpointAddr` as transport-address hints. iroh sends QUIC Initials to
-every configured relay, so the handshake succeeds via whichever relay the peer is
-currently homed on, and hole punching is still attempted for a direct P2P path.
+n0's public infrastructure is never contacted — nothing is published to or
+resolved from `dns.iroh.link`. Two things replace it, and **both are required**:
 
-Here the hints are **required** for connectivity, not just an optimization: with
-discovery off there is no published record to fall back on.
+1. **Relay hints.** The dialer attaches every configured relay URL to the
+   peer's `EndpointAddr` as transport-address hints. iroh sends QUIC Initials
+   to every configured relay, so the handshake succeeds via whichever relay the
+   peer is currently homed on, and hole punching is still attempted for a
+   direct P2P path. This is what *connects*; see
+   [relay-discovery-findings.md](relay-discovery-findings.md).
+2. **A self-hosted lookup service** (an `iroh-dns-server` you run — see
+   [self-hosting.md](self-hosting.md#address-lookup-service-iroh-dns-server-behind-cloudflare-tunnel)).
+   A server with a persistent identity publishes its current home relay to it;
+   every endpoint resolves peers from it over HTTP. This is what lets a relay
+   change *propagate*: it is the publish path every standard iroh deployment
+   has, the one Tailscale's control plane provides, and the one
+   [#4435]-style failover in iroh depends on. Without it a server that moves to
+   another relay can only be found by clients that happen to hint that relay.
+
+The lookup is **additive**: hints carry every dial, the record is an extra
+source, and iroh neither waits for nor fails on a lookup when a hint is
+present. So an outage of the lookup service costs only the propagation of a
+relay change; existing connections and new dials are unaffected. That is why
+one instance is enough and it need not share a host with a relay.
+
+### Configuration
+
+Two options, on **both** sides, next to the relay URLs and the relay token:
+
+| Option | Value |
+|---|---|
+| `lookup_url` | Scheme and host of the lookup service, e.g. `https://lookup.example.com`. No path, query, or fragment — the crate owns the layout below. |
+| `lookup_secret` | The service's capability secret: a `lks1-`-prefixed z-base-32 token (lowercase only, the alphabet iroh uses for endpoint ids in the same URL) carrying its own CRC-32 (see [self-hosting.md](self-hosting.md#generating-the-lookup-secret)). The crate checks the checksum at config load, so a mistyped secret is a startup error, not a silent 404. |
+
+The crate composes `<lookup_url>/<lookup_secret>/pkarr` and hands that base to
+iroh's `PkarrPublisher` (servers with a persistent identity, relay URLs only —
+never direct addresses) and `PkarrResolver` (everyone). Both options are
+**required with custom relays and rejected without them**, exactly like the
+relay token: the default relays never see them.
+
+**Startup is strict here too.** A server publishes its record once, in the
+foreground, before it starts serving; if the lookup service rejects or does not
+answer, startup fails naming it. A client does not probe the lookup service —
+its dial is carried by the hints — but it validates the secret's checksum like
+the server does.
 
 > [!WARNING]
-> Configure **both sides with the full relay list.** Relay failover only works as
-> long as the dialer lists the relay the peer re-homes onto, so a client
-> configured with a subset of the server's relays can reach it only while the
-> server's home relay is in that subset. After its home relay goes offline, an
-> endpoint re-homes onto another configured relay within ~30 seconds (net_report
-> re-probes every 20–26 s).
+> Still configure **both sides with the full relay list**, and run **at least
+> two relays**. The lookup service lets a client learn a relay it did not hint,
+> but only after the server has re-homed and republished; the hints are what
+> keep dials working in the meantime, and with one relay there is nothing to
+> re-home onto. After its home relay goes offline, an endpoint re-homes onto
+> another configured relay within ~30 seconds (net_report re-probes every
+> 20–26 s) and republishes.
 
-A deployment that runs custom relays contacts **no public iroh infrastructure at
-all**. See [relay-discovery-findings.md](relay-discovery-findings.md) for the
-full analysis of why discovery is safe to disable here — iroh internals, the
-failure-mode caveats, and the e2e verification.
+[#4435]: https://github.com/n0-computer/iroh/pull/4435
 
 ## mDNS
 
@@ -88,7 +130,7 @@ the rest of the lookup stack it is not uniform across the three programs:
 
 | Repo | mDNS |
 |---|---|
-| [tunnel-rs] | on in both relay modes; **disabled under `--relay-only`**, which drops every address lookup |
+| [tunnel-rs] | on in both relay modes; **disabled under `--relay-only`**, which drops mDNS and the direct transports (the self-hosted lookup stays: its records carry relay URLs only) |
 | [ezvpn] | **never enabled** — the `mdns` feature is off |
 | [flextunnel] | on in both relay modes; **compiled out on iOS**, where raw multicast needs the `com.apple.developer.networking.multicast` entitlement |
 
@@ -113,7 +155,9 @@ private relay must configure the same token.
 ## Custom relay validation: the per-relay startup probe
 
 Before binding the real endpoint (`flexaccess_iroh::endpoint::create_endpoint`),
-each configured relay is probed **individually** (`relay::probe_custom_relays`)
+each configured relay is probed **individually** (`relay::probe_custom_relays`;
+the lookup service gets its own strict check, described under
+[Custom relays](#configuration))
 by binding a throwaway, relay-only endpoint
 (`clear_ip_transports`, ephemeral identity) for just that one URL and waiting on
 `endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run in
@@ -141,8 +185,10 @@ auth-rejecting relay.
 ## Relay-only mode
 
 Relay-only (`EndpointOptions::relay_only`) drops the direct IP transports and
-every address lookup (including mDNS) on the *real* endpoint, so it is
-reachable only over the configured relays. It requires a custom relay set — the
+mDNS on the *real* endpoint, so it is reachable only over the configured
+relays. The self-hosted lookup service stays installed: its records carry
+relay URLs only, so it can never produce a direct path, and a relay-only
+deployment needs relay changes to propagate like any other. It requires a custom relay set — the
 rate-limited default relays cannot serve it. Because a relay-only dialer tries
 the relays one at a time, `RelayConfig` keeps the configured order (deduping
 only exact repeats): the first URL is the preferred relay.
@@ -175,8 +221,8 @@ builder.
 
 | Repo | Implementation | Notes |
 |---|---|---|
-| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs` | `RelayConfig`, the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` vs `rebuild_endpoint` |
-| [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial; `mdns` on |
+| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/lookup.rs` | `RelayConfig` (relay URLs, token, `lookup_url` + `lookup_secret`), the per-relay probe, the lookup secret format and generator, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` vs `rebuild_endpoint` |
+| [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial, `generate-lookup-secret`; `mdns` on. **First consumer of the mandatory lookup** |
 | [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | VPN ALPN, transport tuning, bounded connect; `mdns` off; iroh fork via `[patch.crates-io]`; on-demand `/healthz` per-relay health check for status UIs |
 | [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; on-demand `/healthz` health check |
 

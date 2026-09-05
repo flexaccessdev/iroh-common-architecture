@@ -11,6 +11,13 @@ This finding is why all three programs ([tunnel-rs], [ezvpn], [flextunnel]) tie
 discovery to the relay mode rather than exposing it as a knob — see
 [relays-and-address-lookup.md](relays-and-address-lookup.md).
 
+> **Update 2026-09-04:** the connectivity finding stands — relay hints alone
+> connect, and n0's public lookup stays off with custom relays — but "no
+> discovery service is needed" no longer does. A **self-hosted** lookup service
+> is now mandatory with custom relays, for a different reason: it is the
+> publish path that lets a server's relay *change* reach its clients, which
+> hints cannot do. See [relay-failover-findings.md](relay-failover-findings.md).
+
 ## Question
 
 When both client and server are configured with the same custom relays, does the

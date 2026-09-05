@@ -7,7 +7,7 @@ documented once, here, instead of drifting across three repos.
 
 | Repo | What it is |
 |---|---|
-| [tunnel-rs] | TCP/UDP port forwarding over iroh. **Reference program for relay-only setups** |
+| [tunnel-rs] | TCP/UDP port forwarding over iroh. **Reference program for relay-only setups, and first consumer of every shared-crate change** |
 | [ezvpn] | Full VPN (TUN device, IP routing) over iroh |
 | [flextunnel] | SOCKS5/HTTP proxy and port forwarding over iroh |
 
@@ -34,8 +34,10 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
 
 - **[relays-and-address-lookup.md](relays-and-address-lookup.md)** — the core
   shared design. Default vs custom relays, how that single choice also decides
-  whether n0 internet discovery is on, relay hints, the shared relay auth token,
-  the strict per-relay startup probe, and relay-only mode. **Start here.**
+  which address lookup stack is used (n0's, or the mandatory self-hosted
+  lookup service with custom relays), relay hints, the shared relay auth token
+  and lookup secret, the strict startup probes, and relay-only mode. **Start
+  here.**
 - **[home-relay-watchdog.md](home-relay-watchdog.md)** — the server-side
   watchdog for a custom-relay server that silently loses its home relay: the
   nudge-then-rebuild escalation, the creation-vs-rebuild policy behind it, the
@@ -47,9 +49,14 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
   NAT type (including symmetric NAT, and why Kubernetes networking depends on the
   CNI rather than on Kubernetes itself), the QUIC/TLS 1.3 encryption stack, and
   performance characteristics.
-- **[self-hosting.md](self-hosting.md)** — running your own iroh relay: local
-  dev, production with TLS, the single-port Cloudflare Tunnel setup, relay access
-  tokens, and how to verify a relay end to end.
+- **[self-hosting.md](self-hosting.md)** — running your own iroh relays and
+  address lookup service: local dev, production with TLS, the single-port
+  Cloudflare Tunnel setup, `iroh-dns-server` behind a capability URL, relay
+  access tokens and the lookup secret, and how to verify it all end to end.
+- **[relay-failover-findings.md](relay-failover-findings.md)** — the analysis
+  (iroh 1.1.0, upstream PR #4435, and how Tailscale/headscale do it) behind
+  making the lookup service mandatory with custom relays, what still works
+  when it is down, and the plan to retire the watchdog.
 - **[relay-discovery-findings.md](relay-discovery-findings.md)** — the analysis
   (against iroh 1.0.2 internals) behind making internet discovery
   non-configurable and tying it to the relay mode.

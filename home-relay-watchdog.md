@@ -71,6 +71,34 @@ it is equally unknown, so the rebuild step stays too.
 [#4444]: https://github.com/n0-computer/iroh/pull/4444
 [#4435]: https://github.com/n0-computer/iroh/pull/4435
 
+## Removal plan
+
+The end state is **no watchdog**: the standard iroh architecture, where a
+server that loses its home relay re-homes onto another configured relay and
+republishes, and peers re-resolve it. Two things were missing for that, and
+they are being put in place in this order:
+
+1. **A publish path.** Custom relays now require a self-hosted lookup service
+   (see [relays-and-address-lookup.md](relays-and-address-lookup.md#custom-relays)
+   and [relay-failover-findings.md](relay-failover-findings.md)). Without it a
+   relay change had no way to reach clients, which is the situation the
+   watchdog's rebuild-with-the-same-identity papered over: it kept the server
+   on a relay the clients already knew instead of letting it move.
+2. **Recovery inside iroh** that uses that path: on 1.1.0 a server re-homes
+   only when net_report stops preferring its current relay, and a client
+   learns the new relay on its next dial; mid-connection migration is
+   [#4435]'s job and is not released.
+
+The watchdog is removed when every program runs with the lookup service and
+the original failure has been reproduced against that setup and observed to
+recover through re-homing and republishing, or shown to be fixed in iroh.
+Until then it stays, because the publish path alone does not address a
+reconnect loop that stops retrying while the relay is healthy (see finding 2
+in [relay-failover-findings.md](relay-failover-findings.md)); in that case a
+net report keeps choosing the same relay and no failover fires. The removal
+itself is already written on the `native-relay-recovery` branches of the crate
+and the three programs.
+
 ## Escalation
 
 The watchdog observes `Endpoint::home_relay_status()` and escalates like a
