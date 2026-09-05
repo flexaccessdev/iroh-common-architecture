@@ -239,7 +239,10 @@ for a while still resolves to its last relay until it comes back.
 
 `handle_path` strips the matched prefix, so `/lks1-…/pkarr/<id>` reaches the
 dns server as `/pkarr/<id>` and `/lks1-…/healthz` as `/healthz`; every other
-path is a 404.
+path is a 404. The site address is a bare `:8080` on purpose: Caddy matches
+sites on the `Host` header and cloudflared forwards the public hostname, so a
+block named `http://127.0.0.1:8080` would match nothing and Caddy would answer
+every path with an empty 200, secret or not.
 
 **3. Point cloudflared at Caddy** on a dedicated hostname:
 
