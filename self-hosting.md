@@ -186,9 +186,16 @@ cargo install iroh-dns-server --version 1.1.0
 iroh-dns-server --config dns.toml
 ```
 
-`dns.toml` (verified against iroh-dns-server 1.1.0):
+`dns.toml` (verified against iroh-dns-server 1.1.0; the top-level keys come
+first because in TOML a key after a `[table]` header belongs to that table):
 
 ```toml
+# Every request arrives from Caddy on localhost, so a per-IP limit would put
+# all publishers in one bucket. The capability URL gates writes instead.
+pkarr_put_rate_limit = "disabled"
+
+data_dir = "/var/lib/iroh-dns"
+
 # Plain HTTP on localhost only; Cloudflare terminates TLS, Caddy fronts this.
 [http]
 port = 8053
@@ -196,17 +203,15 @@ bind_addr = "127.0.0.1"
 # No [https] section: nothing here is exposed directly.
 
 # The DNS listener is mandatory in the config but unused by our programs
-# (they resolve over the HTTP API). Keep it off the tunnel.
+# (they resolve over the HTTP API). Keep it off the tunnel. The root origin
+# "." must be listed: the server keeps its static zone there and refuses to
+# start without an SOA for it.
 [dns]
 port = 5353
 bind_addr = "127.0.0.1"
 default_ttl = 30
-origins = ["lookup.example.com"]
+origins = ["lookup.example.com", "."]
 default_soa = "ns1.lookup.example.com hostmaster.lookup.example.com 0 10800 3600 604800 3600"
-
-# Every request arrives from Caddy on localhost, so a per-IP limit would put
-# all publishers in one bucket. The capability URL gates writes instead.
-pkarr_put_rate_limit = "disabled"
 
 # Never fall back to the public BitTorrent DHT for unknown ids.
 [mainline]
@@ -214,8 +219,6 @@ enabled = false
 
 [metrics]
 disabled = true
-
-data_dir = "/var/lib/iroh-dns"
 ```
 
 Records are republished by each server every 5 minutes with a 30 s TTL; the
